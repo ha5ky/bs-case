@@ -105,40 +105,26 @@ func generateImage(prompt, apiKey string) (string, error) {
 }
 
 func main() {
-	// 默认尝试 Mac 的标准安装路径
-	defaultBlenderPath := "/Applications/Blender.app/Contents/MacOS/Blender"
+	// 默认尝试 Mac 的标准安装路径 (注意小写的 blender)
+	defaultBlenderPath := "/Applications/Blender.app/Contents/MacOS/blender"
 	// 如果环境变量中有 BLENDER_PATH，则优先使用
 	if envPath := os.Getenv("BLENDER_PATH"); envPath != "" {
 		defaultBlenderPath = envPath
 	}
 
 	blenderPath := flag.String("blender", defaultBlenderPath, "Path to Blender executable")
-	projectPath := flag.String("project", "", "Path to the .blend project file (optional template)")
-	modelPath := flag.String("model", "", "Path to the 3D model file (obj, fbx, glb, etc.)")
+	// projectPath := flag.String("project", "", "Path to the .blend project file (optional template)") // 暂时不需要
+	modelPath := flag.String("input", "1.glb", "Path to the 3D model file (obj, fbx, glb, etc.)")
 	texturePath := flag.String("texture", "", "Path to the texture image to replace")
-	prompt := flag.String("prompt", "", "Prompt to generate texture using Nano Banana API")
+	// prompt := flag.String("prompt", "", "Prompt to generate texture using Nano Banana API") // 暂时不需要
 	outputPath := flag.String("output", "output.mp4", "Output video file path")
-	duration := flag.Int("duration", 5, "Duration of the video in seconds")
+	frames := flag.Int("frames", 120, "Number of frames to render")
+	rotations := flag.Float64("rotations", 1.0, "Number of full rotations during the video")
 	flag.Parse()
 
 	// 验证 Blender 路径
 	if _, err := os.Stat(*blenderPath); os.IsNotExist(err) {
 		log.Fatalf("Blender executable not found at %s. \nPlease install Blender or provide the correct path using --blender flag.", *blenderPath)
-	}
-
-	// 1. 如果有 prompt，先调用 API 生成图片
-	finalTexturePath := *texturePath
-	if *prompt != "" {
-		apiKey := os.Getenv("GEMINI_API_KEY")
-		if apiKey == "" {
-			log.Fatal("Error: GEMINI_API_KEY environment variable is required when using --prompt")
-		}
-
-		generatedPath, err := generateImage(*prompt, apiKey)
-		if err != nil {
-			log.Fatalf("Failed to generate image: %v", err)
-		}
-		finalTexturePath = generatedPath
 	}
 
 	// 获取当前工作目录，确保脚本路径正确
@@ -148,55 +134,42 @@ func main() {
 	}
 	scriptPath := filepath.Join(cwd, "render_script.py")
 
-	// 确保输出目录是绝对路径
+	// 确保输入输出目录是绝对路径
 	absOutputPath, err := filepath.Abs(*outputPath)
 	if err != nil {
 		log.Printf("Warning: could not resolve absolute path for output: %v", err)
 		absOutputPath = *outputPath
 	}
 
-	// 构建参数
-	// 模式 1 (默认): blender --background --python render_script.py -- [args]
-	// 模式 2 (模板): blender project.blend --background --python render_script.py -- --keep-scene [args]
-
-	args := []string{}
-
-	if *projectPath != "" {
-		absProjectPath, err := filepath.Abs(*projectPath)
-		if err != nil {
-			log.Printf("Warning: could not resolve absolute path for project: %v", err)
-			absProjectPath = *projectPath
-		}
-		args = append(args, absProjectPath)
+	absModelPath, err := filepath.Abs(*modelPath)
+	if err != nil {
+		log.Printf("Warning: could not resolve absolute path for input model: %v", err)
+		absModelPath = *modelPath
 	}
 
-	args = append(args, "--background", "--python", scriptPath, "--")
-
-	// 如果使用了项目模板，添加 --keep-scene 标志告诉 Python 脚本
-	if *projectPath != "" {
-		args = append(args, "--keep-scene")
-	}
-
-	args = append(args,
-		"--output", absOutputPath,
-		"--duration", fmt.Sprintf("%d", *duration),
-	)
-
-	if *modelPath != "" {
-		absModelPath, err := filepath.Abs(*modelPath)
-		if err != nil {
-			log.Printf("Warning: could not resolve absolute path for model: %v", err)
-			absModelPath = *modelPath
-		}
-		args = append(args, "--model", absModelPath)
-	}
-
-	if finalTexturePath != "" {
-		absTexturePath, err := filepath.Abs(finalTexturePath)
+	absTexturePath := ""
+	if *texturePath != "" {
+		absTexturePath, err = filepath.Abs(*texturePath)
 		if err != nil {
 			log.Printf("Warning: could not resolve absolute path for texture: %v", err)
-			absTexturePath = finalTexturePath
+			absTexturePath = *texturePath
 		}
+	}
+
+	// 构建参数
+	// blender --background --python render_script.py -- --input [file] --output [file] --frames [num] [--texture [file]]
+
+	args := []string{
+		"--background",
+		"--python", scriptPath,
+		"--",
+		"--input", absModelPath,
+		"--output", absOutputPath,
+		"--frames", fmt.Sprintf("%d", *frames),
+		"--rotations", fmt.Sprintf("%f", *rotations),
+	}
+
+	if absTexturePath != "" {
 		args = append(args, "--texture", absTexturePath)
 	}
 

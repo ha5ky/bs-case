@@ -3,24 +3,84 @@ import sys
 import argparse
 import os
 import math
+from mathutils import Vector
 
 def reset_scene():
-    """清除场景中的所有对象"""
+    """清除场景中的所有对象，但保留 World 设置以防万一（虽然我们会覆盖）"""
     bpy.ops.wm.read_factory_settings(use_empty=True)
 
-def setup_camera(scene, location, rotation):
-    """设置摄像机"""
-    bpy.ops.object.camera_add(location=location, rotation=rotation)
+def setup_camera(scene, target_center, target_size):
+    """设置摄像机，使其自动适配目标物体的大小和位置"""
+    # 计算相机位置：在目标中心的前方 (平视)
+    # 距离取决于物体大小
+    cam_dist = target_size * 2.0
+    
+    # 平视视角：Z轴高度与目标中心一致
+    # 之前是 target_size * 0.5 导致了俯视
+    cam_pos = target_center + Vector((0, -cam_dist, 0))
+    
+    bpy.ops.object.camera_add(location=cam_pos)
     camera = bpy.context.object
     scene.camera = camera
+    
+    # 添加 Track To 约束，让相机始终看向物体中心
+    bpy.ops.object.constraint_add(type='TRACK_TO')
+    camera.constraints["Track To"].target = bpy.data.objects.get("CardParent")
+    camera.constraints["Track To"].track_axis = 'TRACK_NEGATIVE_Z'
+    camera.constraints["Track To"].up_axis = 'UP_Y'
+    
+    # 调整焦距 - 使用更长的焦距减少透视变形，看起来更像"平视"
+    camera.data.lens = 85
+    
     return camera
 
-def setup_lighting(location, energy):
-    """设置灯光"""
-    bpy.ops.object.light_add(type='SUN', location=location)
-    light = bpy.context.object
-    light.data.energy = energy
-    return light
+def setup_lighting(center, size):
+    """设置类似 Viewport 的基础环境光和三点布光"""
+    # 1. 设置世界环境光 (World Environment)
+    world = bpy.context.scene.world
+    if not world:
+        world = bpy.data.worlds.new("World")
+        bpy.context.scene.world = world
+    
+    world.use_nodes = True
+    bg_node = world.node_tree.nodes.get('Background')
+    if not bg_node:
+        bg_node = world.node_tree.nodes.new('ShaderNodeBackground')
+        
+    # 设置为中性灰，模拟 Viewport
+    bg_node.inputs[0].default_value = (0.4, 0.4, 0.4, 1) # Color
+    bg_node.inputs[1].default_value = 1.0 # Strength
+    
+    # 2. 三点布光 (相对于物体中心)
+    # 主光 (Key Light)
+    key_pos = center + Vector((size, -size, size))
+    bpy.ops.object.light_add(type='SUN', location=key_pos)
+    key_light = bpy.context.object
+    key_light.data.energy = 5.0 # Sun light intensity is different from Point
+    key_light.rotation_euler = (math.radians(45), 0, math.radians(45))
+    
+    # 补光 (Fill Light) - 柔和一点
+    fill_pos = center + Vector((-size, -size, size*0.5))
+    bpy.ops.object.light_add(type='AREA', location=fill_pos)
+    fill_light = bpy.context.object
+    fill_light.data.energy = 300.0
+    fill_light.data.size = size * 2
+    # 让补光指向中心
+    track = fill_light.constraints.new(type='TRACK_TO')
+    track.target = bpy.data.objects.get("CardParent")
+    track.track_axis = 'TRACK_NEGATIVE_Z'
+    track.up_axis = 'UP_Y'
+
+    # 轮廓光 (Back Light)
+    back_pos = center + Vector((0, size, size))
+    bpy.ops.object.light_add(type='AREA', location=back_pos)
+    back_light = bpy.context.object
+    back_light.data.energy = 500.0
+    back_light.data.size = size
+    track = back_light.constraints.new(type='TRACK_TO')
+    track.target = bpy.data.objects.get("CardParent")
+    track.track_axis = 'TRACK_NEGATIVE_Z'
+    track.up_axis = 'UP_Y'
 
 def import_model(file_path):
     """根据文件扩展名导入模型"""
@@ -33,222 +93,351 @@ def import_model(file_path):
     elif ext in ['.gltf', '.glb']:
         bpy.ops.import_scene.gltf(filepath=file_path)
     elif ext == '.blend':
-        # 如果是 blend 文件，通常直接打开即可，但这会替换当前场景
-        # 这里我们假设是导入对象，或者是打开文件
-        # 为了简单起见，如果脚本作为打开 blend 文件的参数运行，这里不需要做太多
         pass
     else:
         print(f"不支持的文件格式: {ext}")
         sys.exit(1)
 
-def auto_center_view(camera):
-    """简单的自动对焦逻辑：将所有选中的物体居中"""
-    bpy.ops.object.select_all(action='SELECT')
-    # 排除摄像机和灯光
-    for obj in bpy.context.selected_objects:
-        if obj.type in ['CAMERA', 'LIGHT']:
-            obj.select_set(False)
-            
-    if not bpy.context.selected_objects:
-        return
+def get_all_mesh_objects():
+    """获取场景中所有的网格对象"""
+    return [obj for obj in bpy.context.scene.objects if obj.type == 'MESH']
 
-    bpy.ops.view3d.camera_to_view_selected()
+def analyze_and_setup_scene():
+    """
+    分析场景：
+    1. 区分背景和卡片
+    2. 计算卡片的几何中心
+    3. 创建父级 Empty 用于旋转 (不移动原始物体)
+    4. 返回场景的整体中心和大小，用于设置相机
+    """
+    objects = get_all_mesh_objects()
+    if not objects:
+        return Vector((0,0,0)), 1.0
+
+    card_objects = []
+    background_objects = []
+
+    for obj in objects:
+        is_bg = False
+        # 检查材质名称
+        if obj.data.materials:
+            if any("背景" in m.name for m in obj.data.materials if m):
+                is_bg = True
+        
+        # 检查物体名称
+        if "VEN" in obj.name or "CARNAGE" in obj.name:
+            is_bg = True
+            
+        if is_bg:
+            background_objects.append(obj)
+        else:
+            card_objects.append(obj)
+
+    if not card_objects:
+        card_objects = objects
+
+    # 清除卡片对象的现有动画，以避免与转盘动画冲突
+    # (用户希望控制旋转速度，这意味着我们需要接管动画)
+    for obj in card_objects:
+        if obj.animation_data:
+            obj.animation_data_clear()
+
+    # 1. 计算卡片的边界框中心 (用于旋转轴心)
+    min_co = Vector((float('inf'), float('inf'), float('inf')))
+    max_co = Vector((float('-inf'), float('-inf'), float('-inf')))
+    
+    has_card_bounds = False
+    for obj in card_objects:
+        for corner in obj.bound_box:
+            # 转换为世界坐标
+            world_corner = obj.matrix_world @ Vector(corner)
+            min_co = Vector((min(min_co.x, world_corner.x), min(min_co.y, world_corner.y), min(min_co.z, world_corner.z)))
+            max_co = Vector((max(max_co.x, world_corner.x), max(max_co.y, world_corner.y), max(max_co.z, world_corner.z)))
+            has_card_bounds = True
+            
+    if not has_card_bounds:
+        card_center = Vector((0,0,0))
+        card_size = 1.0
+    else:
+        card_center = (min_co + max_co) / 2
+        card_size = max(max_co - min_co)
+
+    # 2. 创建 CardParent (旋转轴心) 在卡片中心
+    bpy.ops.object.empty_add(type='PLAIN_AXES', location=card_center)
+    card_parent = bpy.context.object
+    card_parent.name = "CardParent"
+    
+    # 将卡片物体设为子级 (保持变换 Keep Transform)
+    for obj in card_objects:
+        obj.parent = card_parent
+        obj.matrix_parent_inverse = card_parent.matrix_world.inverted()
+
+    # 3. 计算整个场景的边界 (包括背景)，用于相机定位
+    scene_min = Vector((float('inf'), float('inf'), float('inf')))
+    scene_max = Vector((float('-inf'), float('-inf'), float('-inf')))
+    
+    all_objects = card_objects + background_objects
+    for obj in all_objects:
+        for corner in obj.bound_box:
+            world_corner = obj.matrix_world @ Vector(corner)
+            scene_min = Vector((min(scene_min.x, world_corner.x), min(scene_min.y, world_corner.y), min(scene_min.z, world_corner.z)))
+            scene_max = Vector((max(scene_max.x, world_corner.x), max(scene_max.y, world_corner.y), max(scene_max.z, world_corner.z)))
+            
+    scene_center = (scene_min + scene_max) / 2
+    scene_size = max(scene_max - scene_min)
+    
+    return scene_center, scene_size
 
 def replace_texture(image_path):
     """
     将指定图片应用到模型材质的 Base Color 上。
-    尝试针对场景中所有网格物体。
+    只针对卡片的特定材质（'正面', '反面' 等），避免覆盖背景。
     """
-    if not os.path.exists(image_path):
-        print(f"纹理图片不存在: {image_path}")
+    if not image_path or not os.path.exists(image_path):
+        print(f"Texture image not found: {image_path}")
         return
+
+    print(f"Replacing texture with: {image_path}")
 
     # 1. 加载新图片
     try:
         new_image = bpy.data.images.load(image_path)
     except Exception as e:
-        print(f"无法加载图片 {image_path}: {e}")
+        print(f"Failed to load image {image_path}: {e}")
         return
 
     # 2. 遍历场景中的网格物体
-    objects_to_process = [obj for obj in bpy.context.scene.objects if obj.type == 'MESH']
+    objects_to_process = get_all_mesh_objects()
+
+    # 需要替换纹理的目标材质名称关键词
+    # 用户要求：原本的素材都要保留，只替换"背景"、"正面"、"背面"
+    # 我们这里主要关注卡片的正面和反面。如果用户确实想换背景图，也可以包含 '背景'
+    # 但为了防止意外修改环境背景，我们暂时只锁定 '正面', '反面', '背面'
+    target_materials = ['正面', '反面', '背面']
 
     # 3. 遍历物体和材质
     for obj in objects_to_process:
         if not obj.data.materials:
-            # 如果没有材质，创建一个新材质
-            mat = bpy.data.materials.new(name=f"{obj.name}_Material")
-            mat.use_nodes = True
-            obj.data.materials.append(mat)
+            continue
         
+        # 跳过背景对象 (VEN - CARNAGE)
+        # 除非我们确定要替换背景
+        if "VEN" in obj.name or "CARNAGE" in obj.name:
+            continue
+
         for mat in obj.data.materials:
             if not mat or not mat.use_nodes:
                 continue
             
+            # 严格匹配：只有当材质名称包含目标关键词时才进行替换
+            # 这能确保"磨砂"、"亚克力"、"白色材质"等其他素材不被修改
+            is_target = any(tm in mat.name for tm in target_materials)
+            
+            if not is_target:
+                continue
+
+            print(f"Found target material: {mat.name} on {obj.name}")
+            
             nodes = mat.node_tree.nodes
+            links = mat.node_tree.links
+            
             # 寻找 Principled BSDF 节点
             bsdf = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
             
             if not bsdf:
-                # 如果没有 BSDF 节点，尝试找其他 Shader 节点或者跳过
                 continue
-
-            # 寻找连接到 Base Color 的 Image Texture 节点
+            
+            # 寻找或创建 Image Texture 节点
             tex_node = None
             
             # 检查 Base Color 输入是否有连接
-            # 注意：不同版本的 Blender 属性名可能不同，但在 Principled BSDF 中通常是 'Base Color'
-            base_color_input = bsdf.inputs.get('Base Color')
-            if base_color_input and base_color_input.links:
-                link = base_color_input.links[0]
+            base_color_socket = bsdf.inputs.get('Base Color')
+            if not base_color_socket:
+                base_color_socket = bsdf.inputs.get('BaseColor')
+                
+            if base_color_socket and base_color_socket.is_linked:
+                link = base_color_socket.links[0]
                 if link.from_node.type == 'TEX_IMAGE':
                     tex_node = link.from_node
             
-            # 如果没找到现有的图片节点，就创建一个新的
+            # 如果没有找到纹理节点，但这是目标材质，我们创建一个
             if not tex_node:
-                tex_node = nodes.new('ShaderNodeTexImage')
-                tex_node.location = (-300, 300)
-                # 连接到 Base Color
-                if base_color_input:
-                    mat.node_tree.links.new(tex_node.outputs['Color'], base_color_input)
+                print(f"Creating new texture node for {mat.name}")
+                tex_node = nodes.new(type='ShaderNodeTexImage')
+                if base_color_socket:
+                    links.new(tex_node.outputs['Color'], base_color_socket)
             
-            # 4. 替换图片
-            tex_node.image = new_image
-            print(f"已将图片 {image_path} 应用到物体 {obj.name} 的材质 {mat.name}")
+            if tex_node:
+                # 设置图片
+                tex_node.image = new_image
+                print(f"Applied texture to material: {mat.name} on object {obj.name}")
 
-def configure_render(scene, output_path, resolution_x=1920, resolution_y=1080, fps=24, duration_sec=5):
-    """配置渲染设置"""
-    scene.render.engine = 'BLENDER_EEVEE' # 使用 Eevee 渲染引擎，速度快
-    scene.render.resolution_x = resolution_x
-    scene.render.resolution_y = resolution_y
-    scene.render.fps = fps
+def setup_turntable_animation(frames=120, rotations=1):
+    """设置转盘动画"""
+    # 之前是 "ModelParent"，现在改为 "CardParent"
+    parent_empty = bpy.data.objects.get("CardParent")
+    if not parent_empty:
+        # 如果找不到 CardParent，尝试找 ModelParent (兼容旧逻辑)
+        parent_empty = bpy.data.objects.get("ModelParent")
     
-    # 设置输出格式为 FFmpeg 视频
+    if not parent_empty:
+        return
+
+    parent_empty.rotation_mode = 'XYZ'
+    
+    # 0帧
+    parent_empty.rotation_euler.z = 0
+    parent_empty.keyframe_insert(data_path="rotation_euler", frame=1, index=2)
+    
+    # 最后一帧
+    parent_empty.rotation_euler.z = 2 * math.pi * rotations
+    parent_empty.keyframe_insert(data_path="rotation_euler", frame=frames + 1, index=2)
+
+    # 设置线性插值
+    for fcurve in parent_empty.animation_data.action.fcurves:
+        for keyframe in fcurve.keyframe_points:
+            keyframe.interpolation = 'LINEAR'
+
+def setup_render_settings(scene, output_path, frames=120, is_blend_file=False):
+    """配置渲染设置"""
+    
+    # 无论是否是 blend 文件，我们都需要设置输出路径和帧数
+    scene.render.filepath = output_path
+    scene.frame_start = 1
+    scene.frame_end = frames
+
+    # 如果是 blend 文件，我们信任文件中的渲染设置（引擎、分辨率、色彩空间等）
+    # 只确保输出格式是我们想要的视频格式 (为了兼容性，我们还是强制输出为视频)
+    if is_blend_file:
+        print("Using render settings from project file (Resolution, Engine, Color Management).")
+        # 确保输出是视频而不是图片序列
+        scene.render.image_settings.file_format = 'FFMPEG'
+        
+        # 用户明确要求导出 MP4
+        # 强制设置容器格式为 MPEG-4 (即使原文件是 MKV)
+        scene.render.ffmpeg.format = 'MPEG4'
+        scene.render.ffmpeg.codec = 'H264'
+        
+        # 确保高质量输出
+        scene.render.ffmpeg.constant_rate_factor = 'HIGH'
+        scene.render.ffmpeg.ffmpeg_preset = 'GOOD'
+        return
+
+    # 下面是针对非 blend 文件 (glb/obj导入) 的默认设置
+    # Blender 4.2+ 推荐使用 BLENDER_EEVEE_NEXT，但也可能只有 BLENDER_EEVEE
+    # 我们使用 try-except 来安全地设置引擎
+    try:
+        scene.render.engine = 'BLENDER_EEVEE_NEXT'
+    except:
+        try:
+            scene.render.engine = 'BLENDER_EEVEE'
+        except:
+            print("Warning: EEVEE engine not found, falling back to CYCLES")
+            scene.render.engine = 'CYCLES'
+            scene.cycles.device = 'CPU'
+            scene.cycles.samples = 32
+
+    # 增加曝光度，防止太暗
+    scene.view_settings.exposure = 1.0 
+    # Blender 4.0+ 使用 AgX，旧版 Look 名称可能不同
+    # 我们尝试设置，如果失败则使用默认或兼容值
+    try:
+        scene.view_settings.look = 'AgX - High Contrast'
+    except TypeError:
+        try:
+            scene.view_settings.look = 'High Contrast'
+        except:
+            pass # 保持默认
+
+    # 分辨率
+    scene.render.resolution_x = 1080
+    scene.render.resolution_y = 1080
+    scene.render.resolution_percentage = 100
+
+    # 输出格式
     scene.render.image_settings.file_format = 'FFMPEG'
     scene.render.ffmpeg.format = 'MPEG4'
     scene.render.ffmpeg.codec = 'H264'
-    scene.render.ffmpeg.constant_rate_factor = 'MEDIUM'
+    scene.render.ffmpeg.constant_rate_factor = 'HIGH'
     scene.render.ffmpeg.ffmpeg_preset = 'GOOD'
-    
-    scene.render.filepath = output_path
 
-    # 设置动画时长
-    scene.frame_start = 1
-    scene.frame_end = fps * duration_sec
-
-def create_turntable_animation(scene, duration_sec, fps):
-    """创建一个简单的转台动画：让所有物体绕 Z 轴旋转，或者让摄像机绕物体旋转"""
-    # 这里简单起见，我们在场景中心创建一个空物体，作为所有导入模型的父级，然后旋转空物体
-    
-    bpy.ops.object.select_all(action='DESELECT')
-    
-    # 选择所有网格物体
-    mesh_objects = [obj for obj in scene.objects if obj.type == 'MESH']
-    if not mesh_objects:
-        # 如果没有模型，创建一个立方体演示
-        bpy.ops.mesh.primitive_cube_add()
-        mesh_objects = [bpy.context.object]
-    
-    # 创建空物体作为父级
-    bpy.ops.object.empty_add(type='PLAIN_AXES', location=(0, 0, 0))
-    parent_empty = bpy.context.object
-    
-    for obj in mesh_objects:
-        obj.select_set(True)
-    
-    parent_empty.select_set(True)
-    bpy.context.view_layer.objects.active = parent_empty
-    bpy.ops.object.parent_set(type='OBJECT', keep_transform=True)
-    
-    # 设置关键帧
-    parent_empty.rotation_euler = (0, 0, 0)
-    parent_empty.keyframe_insert(data_path="rotation_euler", frame=1)
-    
-    parent_empty.rotation_euler = (0, 0, 2 * math.pi) # 360度
-    parent_empty.keyframe_insert(data_path="rotation_euler", frame=scene.frame_end + 1)
-    
-    # 将插值模式设置为线性
-    if parent_empty.animation_data and parent_empty.animation_data.action:
-        for fcurve in parent_empty.animation_data.action.fcurves:
-            for keyframe in fcurve.keyframe_points:
-                keyframe.interpolation = 'LINEAR'
 
 def main():
-    # 获取 -- 之后的参数
-    if "--" not in sys.argv:
-        args = []
+    # 获取传递给脚本的参数
+    # Blender 命令行参数在 '--' 之后
+    argv = sys.argv
+    if "--" in argv:
+        argv = argv[argv.index("--") + 1:]
     else:
-        args = sys.argv[sys.argv.index("--") + 1:]
+        argv = []
 
-    parser = argparse.ArgumentParser(description="Blender 渲染脚本")
-    parser.add_argument("--model", help="模型文件路径", required=False)
-    parser.add_argument("--output", help="输出视频路径 (不带扩展名)", required=True)
-    parser.add_argument("--duration", type=int, default=5, help="视频时长(秒)")
-    parser.add_argument("--texture", help="要替换的纹理图片路径", required=False)
-    parser.add_argument("--keep-scene", action="store_true", help="保留现有场景（不重置），用于模板渲染")
+    parser = argparse.ArgumentParser(description="Blender Auto Render Script")
+    parser.add_argument("--input", required=True, help="Input model file path")
+    parser.add_argument("--output", required=True, help="Output video file path")
+    parser.add_argument("--texture", help="Path to texture image to replace")
+    parser.add_argument("--frames", type=int, default=120, help="Number of frames to render")
+    parser.add_argument("--rotations", type=float, default=1.0, help="Number of full rotations")
+    parser.add_argument("--test", action='store_true', help="Test run (render 1 frame)")
     
     try:
-        args = parser.parse_args(args)
+        args = parser.parse_args(argv)
     except SystemExit:
-        # argparse 会在 --help 时调用 sys.exit()，在 Blender 中这会关闭 Blender
+        # argparse 会在 help 时尝试退出，在 Blender 中这可能导致整个 Blender 关闭
+        # 如果是命令行调用没问题，但这里为了安全起见
         return
 
-    # 1. 场景初始化
-    scene = bpy.context.scene
-    if not args.keep_scene:
-        # 如果不是基于模板，则重置场景并设置默认环境
+    print(f"Blender Version: {bpy.app.version_string}")
+
+    ext = os.path.splitext(args.input)[1].lower()
+    is_blend_file = (ext == '.blend')
+
+    if is_blend_file:
+        print(f"Opening project file: {args.input}")
+        bpy.ops.wm.open_mainfile(filepath=args.input)
+        scene = bpy.context.scene
+    else:
+        # 1. 重置场景
         reset_scene()
         scene = bpy.context.scene
-        # 3. 设置摄像机和灯光 (仅在非模板模式下自动设置)
-        camera = setup_camera(scene, location=(0, -10, 5), rotation=(math.radians(60), 0, 0))
-        setup_lighting(location=(5, -5, 10), energy=10)
-        # 4. 摄像机追踪
-        bpy.ops.object.constraint_add(type='TRACK_TO')
-        camera.constraints["Track To"].target = bpy.data.objects.get("Empty")
-        if not camera.constraints["Track To"].target:
-             bpy.ops.object.empty_add(location=(0,0,0))
-             camera.constraints["Track To"].target = bpy.context.object
-        camera.constraints["Track To"].track_axis = 'TRACK_NEGATIVE_Z'
-        camera.constraints["Track To"].up_axis = 'UP_Y'
-    else:
-        # 模板模式：假设模板里已经有了摄像机
-        if not scene.camera:
-            print("警告：模板文件中没有活动摄像机，尝试寻找一个...")
-            cameras = [obj for obj in scene.objects if obj.type == 'CAMERA']
-            if cameras:
-                scene.camera = cameras[0]
-            else:
-                print("错误：模板中没有摄像机，将创建一个默认摄像机")
-                setup_camera(scene, location=(0, -10, 5), rotation=(math.radians(60), 0, 0))
 
-    # 2. 导入模型 (如果有)
-    if args.model and os.path.exists(args.model):
-        import_model(args.model)
-    elif not args.keep_scene:
-        # 只有在非模板模式且没模型时，才创建立方体
-        print("未提供模型或模型不存在，将使用默认立方体演示")
-        bpy.ops.mesh.primitive_cube_add(size=2)
-    
-    # 2.5 替换纹理 (如果有)
+        # 2. 导入模型
+        print(f"Importing {args.input}...")
+        import_model(args.input)
+
+    # 3. 替换纹理 (如果提供)
     if args.texture:
         replace_texture(args.texture)
 
-    # 5. 配置渲染
-    # 注意：如果是模板模式，我们可能不想覆盖分辨率设置，这里需要权衡。
-    # 为了简单，我们暂时假设命令行参数优先级更高，总是覆盖输出路径和时长。
-    configure_render(scene, args.output, duration_sec=args.duration)
-    
-    # 6. 创建旋转动画 (仅在非模板模式，或明确要求时)
-    # 模板通常自带动画。如果我们在模板模式下强行加动画，可能会破坏原有设计。
-    # 策略：如果 args.keep_scene 为 True，跳过自动动画生成，除非我们增加一个强制动画的参数。
-    # 目前保持简单：模板模式下不自动生成转台动画。
-    if not args.keep_scene:
-        create_turntable_animation(scene, args.duration, 24)
+    # 4. 分析场景并设置 Pivot
+    scene_center, scene_size = analyze_and_setup_scene()
 
-    # 7. 开始渲染
-    print(f"开始渲染动画到 {args.output}...")
+    if not is_blend_file:
+        # 5. 设置灯光
+        setup_lighting(scene_center, scene_size)
+
+        # 6. 设置相机
+        setup_camera(scene, scene_center, scene_size)
+    else:
+        print("Using existing camera and lighting from project file.")
+        if not scene.camera:
+             print("Warning: No camera found in project file. Setting up default camera.")
+             setup_camera(scene, scene_center, scene_size)
+
+    # 确定帧数
+    frames = 1 if args.test else args.frames
+    if args.test:
+        print("Running in TEST mode: rendering only 1 frame.")
+
+    # 7. 设置动画
+    setup_turntable_animation(frames=frames, rotations=args.rotations)
+
+    # 7. 渲染设置
+    setup_render_settings(scene, args.output, frames=frames, is_blend_file=is_blend_file)
+
+    # 8. 开始渲染
+    print(f"Rendering to {args.output}...")
     bpy.ops.render.render(animation=True)
-    print("渲染完成")
+    print("Render finished.")
 
 if __name__ == "__main__":
     main()
