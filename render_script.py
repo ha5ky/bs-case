@@ -24,10 +24,15 @@ def setup_camera(scene, target_center, target_size):
     scene.camera = camera
     
     # 添加 Track To 约束，让相机始终看向物体中心
+    # 之前是看 "CardParent"，现在改为看 "FocusPoint" (场景中心，含背景)
     bpy.ops.object.constraint_add(type='TRACK_TO')
-    camera.constraints["Track To"].target = bpy.data.objects.get("CardParent")
-    camera.constraints["Track To"].track_axis = 'TRACK_NEGATIVE_Z'
-    camera.constraints["Track To"].up_axis = 'UP_Y'
+    
+    # 在某些 Blender 版本或语言环境下，约束名称可能不同 (例如中文环境 "Track To" 可能是 "标准跟踪")
+    # 我们直接获取最后一个添加的约束，而不是通过名称索引
+    track_constraint = camera.constraints[-1]
+    track_constraint.target = bpy.data.objects.get("FocusPoint")
+    track_constraint.track_axis = 'TRACK_NEGATIVE_Z'
+    track_constraint.up_axis = 'UP_Y'
     
     # 调整焦距 - 使用更长的焦距减少透视变形，看起来更像"平视"
     camera.data.lens = 85
@@ -102,7 +107,38 @@ def get_all_mesh_objects():
     """获取场景中所有的网格对象"""
     return [obj for obj in bpy.context.scene.objects if obj.type == 'MESH']
 
-def analyze_and_setup_scene():
+def check_if_animation_exists():
+    """检查场景中的卡片对象是否有动画"""
+    objects = get_all_mesh_objects()
+    for obj in objects:
+        if "VEN" in obj.name or "CARNAGE" in obj.name:
+            continue
+        if obj.animation_data and obj.animation_data.action:
+            print(f"Found existing animation on {obj.name}: {obj.animation_data.action.name}")
+            return True
+    return False
+
+def get_animation_length():
+    """获取动画长度（结束帧）"""
+    # 优先使用 Scene 的结束帧，因为通常动画长度和场景设置一致
+    scene_end = bpy.context.scene.frame_end
+    
+    # 也可以检查 Action 的范围
+    max_frame = scene_end
+    objects = get_all_mesh_objects()
+    for obj in objects:
+        if obj.animation_data and obj.animation_data.action:
+             max_frame = max(max_frame, obj.animation_data.action.frame_range[1])
+             
+    # 如果 Action 比 Scene 长很多，可能取 Scene 更合适？
+    # 或者取两者最大值？为了安全起见，我们信任 Scene 的设置，
+    # 除非 Scene 很短而 Action 很长
+    if max_frame > scene_end and scene_end < 2: # 如果 Scene 似乎未设置
+         return int(max_frame)
+         
+    return scene_end
+
+def analyze_and_setup_scene(keep_animation=False):
     """
     分析场景：
     1. 区分背景和卡片
@@ -137,10 +173,11 @@ def analyze_and_setup_scene():
         card_objects = objects
 
     # 清除卡片对象的现有动画，以避免与转盘动画冲突
-    # (用户希望控制旋转速度，这意味着我们需要接管动画)
-    for obj in card_objects:
-        if obj.animation_data:
-            obj.animation_data_clear()
+    # 仅当 keep_animation 为 False 时执行
+    if not keep_animation:
+        for obj in card_objects:
+            if obj.animation_data:
+                obj.animation_data_clear()
 
     # 1. 计算卡片的边界框中心 (用于旋转轴心)
     min_co = Vector((float('inf'), float('inf'), float('inf')))
@@ -172,7 +209,18 @@ def analyze_and_setup_scene():
         obj.parent = card_parent
         obj.matrix_parent_inverse = card_parent.matrix_world.inverted()
 
-    # 3. 计算整个场景的边界 (包括背景)，用于相机定位
+    # -------------------------------------------------------------------------
+    # 3. 处理背景：不放大，保持原样
+    # -------------------------------------------------------------------------
+    # 用户要求：背景图要全显示，不要放大，保持模型文件中的设置
+    # 所以我们移除之前的缩放代码
+    
+    # -------------------------------------------------------------------------
+    # 4. 计算整个场景的边界 (包括背景)，用于相机定位
+    # -------------------------------------------------------------------------
+    # 为了确保背景全显示，我们需要让相机看到所有物体（包括背景）
+    # 并且将相机对焦在整个场景的中心，而不是只对焦卡片
+    
     scene_min = Vector((float('inf'), float('inf'), float('inf')))
     scene_max = Vector((float('-inf'), float('-inf'), float('-inf')))
     
@@ -185,19 +233,29 @@ def analyze_and_setup_scene():
             
     scene_center = (scene_min + scene_max) / 2
     scene_size = max(scene_max - scene_min)
+
+    # 创建一个对焦点 (FocusPoint) 在场景中心
+    # 如果已经存在则获取
+    focus_point = bpy.data.objects.get("FocusPoint")
+    if not focus_point:
+        bpy.ops.object.empty_add(type='PLAIN_AXES', location=scene_center)
+        focus_point = bpy.context.object
+        focus_point.name = "FocusPoint"
+    else:
+        focus_point.location = scene_center
     
     return scene_center, scene_size
 
-def replace_texture(image_path):
+def replace_texture(image_path, target_part="front"):
     """
     将指定图片应用到模型材质的 Base Color 上。
-    只针对卡片的特定材质（'正面', '反面' 等），避免覆盖背景。
+    target_part: "front" (正面), "back" (背面), "background" (背景)
     """
     if not image_path or not os.path.exists(image_path):
         print(f"Texture image not found: {image_path}")
         return
 
-    print(f"Replacing texture with: {image_path}")
+    print(f"Replacing texture with: {image_path}, Target: {target_part}")
 
     # 1. 加载新图片
     try:
@@ -209,28 +267,43 @@ def replace_texture(image_path):
     # 2. 遍历场景中的网格物体
     objects_to_process = get_all_mesh_objects()
 
-    # 需要替换纹理的目标材质名称关键词
-    # 用户要求：原本的素材都要保留，只替换"背景"、"正面"、"背面"
-    # 我们这里主要关注卡片的正面和反面。如果用户确实想换背景图，也可以包含 '背景'
-    # 但为了防止意外修改环境背景，我们暂时只锁定 '正面', '反面', '背面'
-    target_materials = ['正面', '反面', '背面']
+    # 根据 target_part 确定目标材质关键词
+    target_materials = []
+    allow_background_objects = False
+
+    if target_part == "front":
+        target_materials = ['正面']
+    elif target_part == "back":
+        target_materials = ['背面', '反面']
+    elif target_part == "background":
+        target_materials = ['背景']
+        allow_background_objects = True
+    else:
+        # 默认回退到原来的逻辑 (只换正反面)
+        print(f"Unknown target part '{target_part}', defaulting to front/back")
+        target_materials = ['正面', '反面', '背面']
 
     # 3. 遍历物体和材质
     for obj in objects_to_process:
         if not obj.data.materials:
             continue
         
-        # 跳过背景对象 (VEN - CARNAGE)
-        # 除非我们确定要替换背景
-        if "VEN" in obj.name or "CARNAGE" in obj.name:
+        # 检查是否是背景对象 (VEN - CARNAGE)
+        is_bg_obj = "VEN" in obj.name or "CARNAGE" in obj.name
+        
+        # 如果当前不是要替换背景，且遇到了背景对象，则跳过
+        if is_bg_obj and not allow_background_objects:
             continue
-
+            
+        # 如果当前是要替换背景，但对象看起来不像背景（虽然逻辑上只要材质匹配就行，
+        # 但为了效率和安全，我们可以反向过滤？或者干脆不通过对象名过滤，只信材质名）
+        # 这里我们选择：如果允许背景对象，就放行所有对象去检查材质
+        
         for mat in obj.data.materials:
             if not mat or not mat.use_nodes:
                 continue
             
             # 严格匹配：只有当材质名称包含目标关键词时才进行替换
-            # 这能确保"磨砂"、"亚克力"、"白色材质"等其他素材不被修改
             is_target = any(tm in mat.name for tm in target_materials)
             
             if not is_target:
@@ -323,38 +396,68 @@ def setup_render_settings(scene, output_path, frames=120, is_blend_file=False):
         scene.render.ffmpeg.ffmpeg_preset = 'GOOD'
         return
 
-    # 下面是针对非 blend 文件 (glb/obj导入) 的默认设置
-    # Blender 4.2+ 推荐使用 BLENDER_EEVEE_NEXT，但也可能只有 BLENDER_EEVEE
-    # 我们使用 try-except 来安全地设置引擎
-    try:
-        scene.render.engine = 'BLENDER_EEVEE_NEXT'
-    except:
-        try:
-            scene.render.engine = 'BLENDER_EEVEE'
-        except:
-            print("Warning: EEVEE engine not found, falling back to CYCLES")
-            scene.render.engine = 'CYCLES'
-            scene.cycles.device = 'CPU'
-            scene.cycles.samples = 32
+    # -------------------------------------------------------------------------
+    # 针对非 blend 文件 (glb/obj导入)，我们模拟 1.blend 的配置
+    # -------------------------------------------------------------------------
+    print("Applying standard project configuration (from 1.blend)...")
 
-    # 增加曝光度，防止太暗
-    scene.view_settings.exposure = 1.0 
-    # Blender 4.0+ 使用 AgX，旧版 Look 名称可能不同
-    # 我们尝试设置，如果失败则使用默认或兼容值
+    # 1. 渲染引擎: CYCLES
+    scene.render.engine = 'CYCLES'
+    
+    # 尝试启用 GPU
     try:
-        scene.view_settings.look = 'AgX - High Contrast'
-    except TypeError:
-        try:
-            scene.view_settings.look = 'High Contrast'
-        except:
-            pass # 保持默认
+        scene.cycles.device = 'GPU'
+        # 必须设置偏好设置中的设备才能生效
+        prefs = bpy.context.preferences
+        cprefs = prefs.addons['cycles'].preferences
+        
+        # 尝试自动检测 CUDA, METAL, OPTIX
+        for compute_device_type in ('METAL', 'OPTIX', 'CUDA'):
+            try:
+                cprefs.compute_device_type = compute_device_type
+                # 获取可用设备
+                devices = cprefs.get_devices_for_type(compute_device_type)
+                if devices:
+                    print(f"Using Cycles Device: {compute_device_type}")
+                    for device in devices:
+                        device.use = True
+                    break
+            except:
+                continue
+    except Exception as e:
+        print(f"Failed to set GPU: {e}, falling back to CPU")
+        scene.cycles.device = 'CPU'
 
-    # 分辨率
-    scene.render.resolution_x = 1080
-    scene.render.resolution_y = 1080
+    # 采样数 (原工程是 500，为了速度我们设为 128，或者保持 500 如果用户机器强)
+    # 考虑到自动化脚本可能在服务器跑，给个适中的值
+    scene.cycles.samples = 128 
+    # 开启降噪
+    scene.cycles.use_denoising = True
+
+    # 2. 分辨率: 900x1200
+    scene.render.resolution_x = 900
+    scene.render.resolution_y = 1200
     scene.render.resolution_percentage = 100
 
-    # 输出格式
+    # 3. 帧率: 24 fps
+    scene.render.fps = 24
+
+    # 4. 色彩管理: Khronos PBR Neutral / None
+    try:
+        scene.view_settings.view_transform = 'Khronos PBR Neutral'
+    except:
+        # 如果版本不支持，回退到 Standard 或 Filmic
+        scene.view_settings.view_transform = 'Standard'
+        
+    try:
+        scene.view_settings.look = 'None'
+    except:
+        pass
+
+    # 增加一点曝光度以匹配效果 (可选)
+    # scene.view_settings.exposure = 0.0 # 保持默认
+
+    # 5. 输出格式
     scene.render.image_settings.file_format = 'FFMPEG'
     scene.render.ffmpeg.format = 'MPEG4'
     scene.render.ffmpeg.codec = 'H264'
@@ -375,8 +478,12 @@ def main():
     parser.add_argument("--input", required=True, help="Input model file path")
     parser.add_argument("--output", required=True, help="Output video file path")
     parser.add_argument("--texture", help="Path to texture image to replace")
-    parser.add_argument("--frames", type=int, default=120, help="Number of frames to render")
-    parser.add_argument("--rotations", type=float, default=1.0, help="Number of full rotations")
+    parser.add_argument("--texture_target", default="front", help="Target part to replace texture: front, back, background")
+    parser.add_argument("--texture_front", help="Texture image path for front (optional)")
+    parser.add_argument("--texture_back", help="Texture image path for back (optional)")
+    parser.add_argument("--texture_background", help="Texture image path for background (optional)")
+    parser.add_argument("--frames", type=int, default=0, help="Number of frames to render (0 = auto)")
+    parser.add_argument("--rotations", type=float, default=-1.0, help="Number of full rotations (-1 = auto)")
     parser.add_argument("--test", action='store_true', help="Test run (render 1 frame)")
     
     try:
@@ -406,10 +513,50 @@ def main():
 
     # 3. 替换纹理 (如果提供)
     if args.texture:
-        replace_texture(args.texture)
+        replace_texture(args.texture, args.texture_target)
+
+    if args.texture_front:
+        replace_texture(args.texture_front, "front")
+    if args.texture_back:
+        replace_texture(args.texture_back, "back")
+    if args.texture_background:
+        replace_texture(args.texture_background, "background")
+        
+    # --- 决定是否保留原有动画 ---
+    # 如果用户没有指定 rotations (即 -1.0) 且场景中有动画，则保留
+    should_keep_anim = (args.rotations < 0)
+    has_existing_anim = check_if_animation_exists()
+    
+    # 默认值
+    default_frames = 120
+    default_rotations = 1.0
+    
+    keep_animation = False
+    final_frames = default_frames
+    final_rotations = default_rotations
+
+    if should_keep_anim and has_existing_anim:
+        print("Using existing animation from file.")
+        keep_animation = True
+        # 如果保留动画，我们需要知道动画多长
+        anim_len = get_animation_length()
+        # 如果 args.frames 未指定 (0)，则使用动画长度
+        final_frames = args.frames if args.frames > 0 else anim_len
+    else:
+        # 否则，使用默认或用户指定的旋转
+        if args.rotations >= 0:
+            final_rotations = args.rotations
+        else:
+             # 如果没有动画也没指定，使用默认 1.0
+             final_rotations = default_rotations
+             
+        final_frames = args.frames if args.frames > 0 else default_frames
+        
+    print(f"Animation Mode: Keep={keep_animation}, Frames={final_frames}, Rotations={final_rotations}")
 
     # 4. 分析场景并设置 Pivot
-    scene_center, scene_size = analyze_and_setup_scene()
+    # 传递 keep_animation 标志
+    scene_center, scene_size = analyze_and_setup_scene(keep_animation=keep_animation)
 
     if not is_blend_file:
         # 5. 设置灯光
@@ -423,16 +570,18 @@ def main():
              print("Warning: No camera found in project file. Setting up default camera.")
              setup_camera(scene, scene_center, scene_size)
 
-    # 确定帧数
-    frames = 1 if args.test else args.frames
+    # 确定帧数 (Test 模式覆盖一切)
+    frames_to_render = 1 if args.test else final_frames
     if args.test:
         print("Running in TEST mode: rendering only 1 frame.")
 
     # 7. 设置动画
-    setup_turntable_animation(frames=frames, rotations=args.rotations)
+    # 只有当不保留原有动画时，才应用转盘动画
+    if not keep_animation:
+        setup_turntable_animation(frames=frames_to_render, rotations=final_rotations)
 
     # 7. 渲染设置
-    setup_render_settings(scene, args.output, frames=frames, is_blend_file=is_blend_file)
+    setup_render_settings(scene, args.output, frames=frames_to_render, is_blend_file=is_blend_file)
 
     # 8. 开始渲染
     print(f"Rendering to {args.output}...")
