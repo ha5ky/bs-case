@@ -150,10 +150,11 @@ func main() {
 
 	var generatedTexturePath string
 	if *prompt != "" {
-		apiKey := os.Getenv("GEMINI_API_KEY")
+		// apiKey := os.Getenv("GEMINI_API_KEY")
+		apiKey := "AIzaSyDgfG7pVzF_2YZVQ2EcmkEov6DvWq2wc8o"
 		if apiKey == "" {
 			// Fallback to a default key if not set (for testing convenience)
-			apiKey = "AIzaSyBFRSlH9ecz3WeDqgVJ_3zb4HGjXlKrmH8"
+			apiKey = "AIzaSyDWg4UMXvkklr-_0GXPfdw9I69fbtFaBUk"
 			fmt.Println("Warning: GEMINI_API_KEY not set, using fallback key.")
 		}
 
