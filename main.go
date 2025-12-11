@@ -106,6 +106,7 @@ func main() {
 	textureOutput := flag.String("texture_output", "generated_texture.png", "Filename for the generated texture image")
 	imageInput := flag.String("image_input", "", "Path to the input image for generation (optional)")
 	prompt := flag.String("prompt", "", "Extract the card face part of this card and turn it into a flat image without altering the content.")
+	apiKey := flag.String("api_key", "", "your apiKey")
 	outputPath := flag.String("output", "output.mp4", "Output video file path")
 	frames := flag.Int("frames", 0, "Number of frames to render (0 = auto/from file)")
 	rotations := flag.Float64("rotations", -1.0, "Number of full rotations (-1 = auto/from file)")
@@ -151,19 +152,17 @@ func main() {
 	var generatedTexturePath string
 	if *prompt != "" {
 		// apiKey := os.Getenv("GEMINI_API_KEY")
-		apiKey := "AIzaSyDgfG7pVzF_2YZVQ2EcmkEov6DvWq2wc8o"
-		if apiKey == "" {
+		if *apiKey == "" {
 			// Fallback to a default key if not set (for testing convenience)
-			apiKey = "AIzaSyDWg4UMXvkklr-_0GXPfdw9I69fbtFaBUk"
 			fmt.Println("Warning: GEMINI_API_KEY not set, using fallback key.")
 		}
 
-		if apiKey == "" {
+		if *apiKey == "" {
 			log.Fatal("GEMINI_API_KEY environment variable is not set. Please set it to use Nano Banana API.")
 		}
 
 		var err error
-		generatedTexturePath, err = generateImage(context.Background(), *prompt, apiKey, *textureOutput, *imageInput, *aspectRatio, *imageSize)
+		generatedTexturePath, err = generateImage(context.Background(), *prompt, *apiKey, *textureOutput, *imageInput, *aspectRatio, *imageSize)
 		if err != nil {
 			log.Fatalf("Failed to generate texture: %v", err)
 		}
